@@ -1,0 +1,7 @@
+streamlit>=1.38
+pydantic>=2.7
+pdfplumber>=0.11
+python-dotenv>=1.0
+python-dateutil>=2.9
+google-genai>=0.3
+groq>=0.11
