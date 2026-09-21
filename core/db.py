@@ -1,11 +1,3 @@
-"""
-Lightweight SQLite persistence for the prototype.
-
-For production this becomes Postgres + proper migrations, but for a
-one-week prototype SQLite keeps the deliverable to a single file with
-zero setup for the panel to run.
-"""
-
 from __future__ import annotations
 import json
 import sqlite3
@@ -13,6 +5,9 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from core.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 DB_PATH = Path(__file__).parent.parent / "data" / "surecover.db"
 
@@ -25,6 +20,7 @@ def get_conn():
 
 
 def init_db():
+    logger.info("Initializing SQLite database: path=%s", DB_PATH)
     with get_conn() as conn:
         conn.execute(
             """
@@ -60,9 +56,11 @@ def init_db():
             """
         )
         conn.commit()
+    logger.info("SQLite database initialized")
 
 
 def seed_policies(records: list[dict]):
+    logger.info("Seeding policies: count=%d", len(records))
     with get_conn() as conn:
         for r in records:
             conn.execute(
@@ -78,17 +76,21 @@ def seed_policies(records: list[dict]):
 
 def get_policy(policy_number: Optional[str]) -> Optional[dict]:
     if not policy_number:
+        logger.warning("Policy lookup skipped: empty policy number")
         return None
     with get_conn() as conn:
         row = conn.execute(
             "SELECT * FROM policies WHERE policy_number = ?", (policy_number,)
         ).fetchone()
-        return dict(row) if row else None
+        policy = dict(row) if row else None
+        logger.info("Policy lookup completed: found=%s", policy is not None)
+        return policy
 
 
 def find_duplicate(policy_number: Optional[str], flight_number: Optional[str]) -> Optional[str]:
     """Returns an existing claim_id if the same policy+flight was already submitted."""
     if not policy_number or not flight_number:
+        logger.info("Duplicate check skipped: policy or flight number is empty")
         return None
     with get_conn() as conn:
         row = conn.execute(
@@ -96,11 +98,19 @@ def find_duplicate(policy_number: Optional[str], flight_number: Optional[str]) -
             "ORDER BY created_at ASC LIMIT 1",
             (policy_number, flight_number),
         ).fetchone()
-        return row["claim_id"] if row else None
+        duplicate_id = row["claim_id"] if row else None
+        logger.info("Duplicate check completed: found=%s", duplicate_id is not None)
+        return duplicate_id
 
 
 def save_claim(extracted, assessment, bundle) -> str:
     claim_id = f"SC-{datetime.utcnow().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
+    logger.info(
+        "Saving claim: claim_id=%s, policy_present=%s, flight_present=%s",
+        claim_id,
+        bool(extracted.policy_number),
+        bool(extracted.flight_number),
+    )
     with get_conn() as conn:
         conn.execute(
             """
@@ -127,10 +137,12 @@ def save_claim(extracted, assessment, bundle) -> str:
             ),
         )
         conn.commit()
+    logger.info("Claim saved: claim_id=%s", claim_id)
     return claim_id
 
 
 def list_claims(status: Optional[str] = None):
+    logger.info("Listing claims: status=%s", status or "ALL")
     with get_conn() as conn:
         if status and status != "ALL":
             rows = conn.execute(
@@ -142,12 +154,19 @@ def list_claims(status: Optional[str] = None):
 
 
 def get_claim(claim_id: str):
+    logger.info("Loading claim detail: claim_id=%s", claim_id)
     with get_conn() as conn:
         row = conn.execute("SELECT * FROM claims WHERE claim_id = ?", (claim_id,)).fetchone()
         return dict(row) if row else None
 
 
 def update_decision(claim_id: str, decision: str, notes: str = ""):
+    logger.info(
+        "Updating Ops decision: claim_id=%s, decision=%s, has_notes=%s",
+        claim_id,
+        decision,
+        bool(notes.strip()),
+    )
     with get_conn() as conn:
         conn.execute(
             "UPDATE claims SET ops_decision = ?, ops_notes = ?, decided_at = ? WHERE claim_id = ?",

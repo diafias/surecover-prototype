@@ -3,6 +3,9 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from core.db import init_db, list_claims, get_claim, update_decision
+from core.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 load_dotenv()
 init_db()
@@ -15,6 +18,7 @@ status_filter = st.selectbox(
     "Filter by status", ["ALL", "PENDING", "APPROVED", "REJECTED", "REQUEST_INFO"]
 )
 claims = list_claims(status=status_filter)
+logger.info("Ops review loaded: status_filter=%s, claim_count=%d", status_filter, len(claims))
 
 if not claims:
     st.info("No claims match this filter yet. Submit one from the 'Submit Claim' page.")
@@ -112,12 +116,15 @@ st.subheader("Ops decision")
 notes = st.text_area("Notes (optional — required if overriding the AI recommendation)")
 b1, b2, b3 = st.columns(3)
 if b1.button("✅ Approve", use_container_width=True):
+    logger.info("Ops action selected: claim_id=%s, decision=APPROVED", claim["claim_id"])
     update_decision(claim["claim_id"], "APPROVED", notes)
     st.rerun()
 if b2.button("❌ Reject", use_container_width=True):
+    logger.info("Ops action selected: claim_id=%s, decision=REJECTED", claim["claim_id"])
     update_decision(claim["claim_id"], "REJECTED", notes)
     st.rerun()
 if b3.button("✉️ Request Information", use_container_width=True):
+    logger.info("Ops action selected: claim_id=%s, decision=REQUEST_INFO", claim["claim_id"])
     update_decision(claim["claim_id"], "REQUEST_INFO", notes)
     st.rerun()
 

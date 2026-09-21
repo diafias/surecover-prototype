@@ -20,16 +20,14 @@ class ExtractedClaimData(BaseModel):
     customer_name: Optional[str] = None
     policy_number: Optional[str] = None
     flight_number: Optional[str] = None
-    scheduled_departure: Optional[str] = None  # ISO-ish string, best effort
+    scheduled_departure: Optional[str] = None  
     actual_departure: Optional[str] = None
     delay_hours: Optional[float] = None
     delay_reason: Optional[str] = None
     claim_type: str = "Flight Delay"
     return_to_singapore_date: Optional[str] = None
     airline: Optional[str] = None
-
-    # bookkeeping, filled in by our own code, not the LLM
-    source: str = "unknown"  # "gemini" | "groq" | "rule_based"
+    source: str = "unknown"  
     extraction_notes: List[str] = Field(default_factory=list)
 
 

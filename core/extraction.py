@@ -1,18 +1,3 @@
-"""
-Document understanding layer.
-
-Pipeline: PDF/text -> raw text -> structured ExtractedClaimData
-
-Fallback chain (this is the bit worth highlighting in the presentation):
-    1. Gemini (primary) - multimodal, cheap, fast
-    2. Groq / GPT-OSS (secondary) - used if Gemini errors or rate-limits (429)
-    3. Rule-based regex extraction (last resort) - guarantees the demo
-       NEVER hard-fails just because an API quota ran out.
-
-This mirrors a real production pattern: probabilistic extraction should
-degrade gracefully, not take the whole pipeline down.
-"""
-
 from __future__ import annotations
 import json
 import os
@@ -20,19 +5,20 @@ import re
 from typing import Optional
 
 from core.models import ExtractedClaimData
+from core.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 try:
     import pdfplumber
-except ImportError:  # pragma: no cover
+except ImportError:  
     pdfplumber = None
 
-
-# --------------------------------------------------------------------------
-# PDF -> text
-# --------------------------------------------------------------------------
+# PDF -> text (pdfplumber)
 def extract_text_from_pdf(file_bytes: bytes) -> Optional[str]:
     """Returns None if the PDF couldn't be read (scanned/corrupt/no text layer)."""
     if pdfplumber is None:
+        logger.warning("PDF extraction skipped: pdfplumber unavailable")
         return None
     try:
         import io
@@ -43,25 +29,18 @@ def extract_text_from_pdf(file_bytes: bytes) -> Optional[str]:
                 if t:
                     text_chunks.append(t)
         text = "\n".join(text_chunks).strip()
+        logger.info("PDF extraction completed: has_text=%s, characters=%d", bool(text), len(text))
         return text if text else None
     except Exception:
+        logger.exception("PDF extraction failed")
         return None
 
-
+# PDF -> text (gemini)
 def gemini_pdf_to_text(file_bytes: bytes) -> Optional[str]:
-    """
-    Last-resort fallback for documents pdfplumber couldn't read (e.g. scanned
-    images with no text layer). Sends the raw PDF to Gemini's multimodal
-    endpoint and asks it to transcribe the readable content as plain text.
-
-    This is deliberately kept OUT of the main extraction fallback chain
-    (Gemini -> Groq -> rule-based) because it solves a different problem:
-    pdfplumber failing at the text-layer stage, not the LLM provider being
-    unavailable. It's a per-document repair step, tried once per document,
-    before that document is given up on and flagged unreadable.
-    """
+    """Transcribe a scanned or unreadable PDF with Gemini as plain text."""
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
+        logger.info("Gemini PDF transcription skipped: API key unavailable")
         return None
     try:
         from google import genai
@@ -76,15 +55,12 @@ def gemini_pdf_to_text(file_bytes: bytes) -> Optional[str]:
             ],
         )
         text = (response.text or "").strip()
+        logger.info("Gemini PDF transcription completed: has_text=%s, characters=%d", bool(text), len(text))
         return text if text else None
-    except Exception as e:
-        print(f"[extraction] Gemini native PDF read failed: {e}")
+    except Exception:
+        logger.exception("Gemini PDF transcription failed")
         return None
 
-
-# --------------------------------------------------------------------------
-# LLM prompt (shared across providers)
-# --------------------------------------------------------------------------
 EXTRACTION_PROMPT_TEMPLATE = """You are a document-understanding assistant for a travel insurance claims desk.
 Extract the following fields from the claim documents below. Respond with ONLY a JSON object,
 no markdown fences, no commentary. Use null for any field you cannot find.
@@ -130,12 +106,11 @@ def _parse_json_response(raw: str) -> Optional[dict]:
         return None
 
 
-# --------------------------------------------------------------------------
 # Provider 1: Gemini
-# --------------------------------------------------------------------------
 def _try_gemini(documents_text: str) -> Optional[dict]:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
+        logger.info("Gemini structured extraction skipped: API key unavailable")
         return None
     try:
         from google import genai
@@ -144,18 +119,19 @@ def _try_gemini(documents_text: str) -> Optional[dict]:
             model="gemini-3.6-flash",
             contents=_build_prompt(documents_text),
         )
-        return _parse_json_response(response.text)
-    except Exception as e:
-        print(f"[extraction] Gemini failed, falling back: {e}")
+        data = _parse_json_response(response.text)
+        logger.info("Gemini structured extraction completed: valid_json=%s", data is not None)
+        return data
+    except Exception:
+        logger.exception("Gemini structured extraction failed; trying Groq")
         return None
 
 
-# --------------------------------------------------------------------------
 # Provider 2: Groq (GPT-OSS)
-# --------------------------------------------------------------------------
 def _try_groq(documents_text: str) -> Optional[dict]:
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
+        logger.info("Groq structured extraction skipped: API key unavailable")
         return None
     try:
         from groq import Groq
@@ -166,15 +142,15 @@ def _try_groq(documents_text: str) -> Optional[dict]:
             temperature=0,
         )
         raw = completion.choices[0].message.content
-        return _parse_json_response(raw)
-    except Exception as e:
-        print(f"[extraction] Groq failed, falling back: {e}")
+        data = _parse_json_response(raw)
+        logger.info("Groq structured extraction completed: valid_json=%s", data is not None)
+        return data
+    except Exception:
+        logger.exception("Groq structured extraction failed; trying rule-based extraction")
         return None
 
 
-# --------------------------------------------------------------------------
 # Provider 3: rule-based fallback (regex) - guarantees the demo always works
-# --------------------------------------------------------------------------
 def _rule_based_extract(documents_text: str) -> dict:
     text = documents_text
 
@@ -183,7 +159,7 @@ def _rule_based_extract(documents_text: str) -> dict:
         return m.group(1).strip() if m else default
 
     flight_number = find(r"\b([A-Z]{2}\s?\d{2,4})\b", flags=0)
-    policy_number = find(r"(?:policy\s*(?:no\.?|number)?[:\s]*)([A-Z0-9\-]{5,})")
+    policy_number = find(r"policy\s*(?:no\.?|number)?\s*:\s*([A-Z0-9][A-Z0-9\-]{4,})\b")
     delay_hours_str = find(r"delay(?:ed)?\s*(?:of|for|by)?\s*([\d.]+)\s*hours?")
     customer_name = find(r"(?:name|customer)[:\s]+([A-Za-z .]{3,40})")
 
@@ -192,7 +168,7 @@ def _rule_based_extract(documents_text: str) -> dict:
     return_date = find(r"Return to Singapore Date:\s*([\d\-]{8,12})")
     delay_reason = find(r"due to ([a-zA-Z ]{3,40})")
 
-    return {
+    result = {
         "customer_name": customer_name,
         "policy_number": policy_number,
         "flight_number": flight_number,
@@ -204,11 +180,16 @@ def _rule_based_extract(documents_text: str) -> dict:
         "return_to_singapore_date": return_date,
         "airline": None,
     }
+    logger.info(
+        "Rule-based extraction completed: policy_present=%s, flight_present=%s, delay_hours=%s",
+        bool(policy_number),
+        bool(flight_number),
+        result["delay_hours"],
+    )
+    return result
 
 
-# --------------------------------------------------------------------------
 # Public entry point
-# --------------------------------------------------------------------------
 def extract_claim_data(documents_text: str) -> ExtractedClaimData:
     """Runs the fallback chain and returns a validated ExtractedClaimData."""
     notes: list[str] = []
@@ -226,6 +207,8 @@ def extract_claim_data(documents_text: str) -> ExtractedClaimData:
         data = _rule_based_extract(documents_text)
         source = "rule_based"
 
+    logger.info("Structured claim extraction selected source=%s", source)
+
     data = dict(data or {})
     data["source"] = source
     data["extraction_notes"] = notes + list(data.get("extraction_notes", []))
@@ -234,4 +217,5 @@ def extract_claim_data(documents_text: str) -> ExtractedClaimData:
         return ExtractedClaimData(**data)
     except Exception as e:
         notes.append(f"Validation error, some fields defaulted: {e}")
+        logger.exception("Structured claim validation failed")
         return ExtractedClaimData(source=source, extraction_notes=notes)

@@ -1,27 +1,16 @@
-"""
-Deterministic policy engine.
-
-Intentionally NOT an LLM call. Eligibility decisions must be explainable
-and reproducible - "the LLM handles unstructured document understanding,
-while policy eligibility is enforced through deterministic rules to
-improve reliability and explainability."
-
-Everything here is plain Python `if` statements on structured data.
-"""
-
 from __future__ import annotations
 from datetime import datetime, date
 from typing import Optional
-from dateutil import parser as dateparser  # lightweight, forgiving date parsing
-
+from dateutil import parser as dateparser 
 from core.models import ExtractedClaimData, DocumentBundle, PolicyAssessment, CompletenessCheck
+from core.logging_config import get_logger
 
-# --------------------------------------------------------------------------
+logger = get_logger(__name__)
+
 # Simplified policy configuration (edit these to simulate different products)
-# --------------------------------------------------------------------------
 COVERED_CLAIM_TYPES = {"Flight Delay"}
 MIN_DELAY_HOURS = 3.0
-CLAIM_WINDOW_DAYS = 30  # working days from return to Singapore (simplified as calendar days here)
+CLAIM_WINDOW_DAYS = 30 
 
 REQUIRED_DOCUMENTS = ["claim_form", "itinerary", "boarding_pass", "delay_letter"]
 
@@ -92,13 +81,22 @@ def evaluate_policy(
     if claim_type_covered and delay_threshold_met and within_claim_window and policy_active and not reasons:
         reasons.append("Claim type, delay duration, claim window, and coverage period all satisfy policy conditions.")
 
-    return PolicyAssessment(
+    result = PolicyAssessment(
         claim_type_covered=claim_type_covered,
         delay_threshold_met=delay_threshold_met,
         within_claim_window=within_claim_window,
         policy_active=policy_active,
         reasons=reasons,
     )
+    logger.info(
+        "Policy evaluation: covered=%s, claim_type=%s, delay_threshold=%s, claim_window=%s, policy_active=%s",
+        result.policy_covered,
+        result.claim_type_covered,
+        result.delay_threshold_met,
+        result.within_claim_window,
+        result.policy_active,
+    )
+    return result
 
 
 def check_completeness(
@@ -139,23 +137,35 @@ def check_completeness(
     elif not claim.policy_number:
         inconsistencies.append("Policy number could not be extracted from the claim form.")
 
-    return CompletenessCheck(
+    result = CompletenessCheck(
         documents_complete=len(missing) == 0,
         missing_documents=missing,
         information_consistent=len(inconsistencies) == 0,
         inconsistencies=inconsistencies,
     )
+    logger.info(
+        "Completeness check: documents_complete=%s, information_consistent=%s, missing_count=%d, inconsistency_count=%d",
+        result.documents_complete,
+        result.information_consistent,
+        len(result.missing_documents),
+        len(result.inconsistencies),
+    )
+    return result
 
 
 def build_recommendation(policy: PolicyAssessment, completeness: CompletenessCheck) -> tuple[str, str]:
     """Returns (recommendation, reason). Pure deterministic decision tree."""
     if not completeness.documents_complete:
+        logger.info("Recommendation selected: REQUEST_INFO due to incomplete documents")
         return "REQUEST_INFO", "Missing required document(s): " + ", ".join(completeness.missing_documents)
 
     if not completeness.information_consistent:
+        logger.info("Recommendation selected: REQUEST_INFO due to inconsistencies")
         return "REQUEST_INFO", "Inconsistencies found across documents: " + "; ".join(completeness.inconsistencies)
 
     if not policy.policy_covered:
+        logger.info("Recommendation selected: REJECT due to policy failure")
         return "REJECT", " ".join(policy.reasons)
 
+    logger.info("Recommendation selected: APPROVE")
     return "APPROVE", "All policy conditions met; documents complete and consistent."

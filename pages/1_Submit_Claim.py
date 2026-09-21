@@ -7,6 +7,9 @@ from core.policy import evaluate_policy, check_completeness, build_recommendatio
 from core.models import ClaimAssessment
 from core.db import init_db, get_policy, find_duplicate, save_claim
 from core.sample_data import SAMPLES
+from core.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 load_dotenv()
 init_db()
@@ -60,18 +63,27 @@ else:
         uploaded = st.file_uploader(label, type=["pdf"], key=f"upload_{key}")
         if uploaded is not None:
             file_bytes = uploaded.getvalue()  # getvalue() so the stream can be read again if needed
+            logger.info("Document uploaded: type=%s, bytes=%d", key, len(file_bytes))
             text = extract_text_from_pdf(file_bytes)
             if text is None:
+                logger.info("Trying Gemini PDF transcription: type=%s", key)
                 st.info("Text layer not found (likely a scanned document) — trying Gemini native PDF reading...")
                 text = gemini_pdf_to_text(file_bytes)
             if text is None:
                 unreadable.append(key)
+                logger.warning("Document marked unreadable: type=%s", key)
                 st.warning("Could not extract text from this PDF — flagged as unreadable.")
             else:
                 st.success("Document read successfully.")
             bundle_texts[key] = text
 
 if st.button("Submit Claim", type="primary"):
+    logger.info(
+        "Claim submission started: sample=%s, document_count=%d, unreadable_count=%d",
+        use_sample != "None",
+        sum(text is not None for text in bundle_texts.values()),
+        len(unreadable),
+    )
     bundle = DocumentBundle(
         claim_form_text=bundle_texts["claim_form"],
         itinerary_text=bundle_texts["itinerary"],
@@ -85,7 +97,6 @@ if st.button("Submit Claim", type="primary"):
         for name, text in bundle_texts.items()
         if text
     )
-    # Fold in the manually-typed name/policy number as extra context for the LLM
     combined_text = (
         f"Customer name (as entered in form): {customer_name_input}\n"
         f"Policy number (as entered in form): {policy_number_input}\n\n" + combined_text
@@ -93,10 +104,12 @@ if st.button("Submit Claim", type="primary"):
 
     with st.spinner("Extracting structured data from documents..."):
         extracted = extract_claim_data(combined_text)
+    logger.info("Claim fields extracted: source=%s", extracted.source)
 
-    # Prefer form-entered values if the LLM/extraction missed them
-    extracted.customer_name = extracted.customer_name or customer_name_input or None
-    extracted.policy_number = extracted.policy_number or policy_number_input or None
+    if customer_name_input.strip():
+        extracted.customer_name = customer_name_input.strip()
+    if policy_number_input.strip():
+        extracted.policy_number = policy_number_input.strip().upper()
 
     policy_record = get_policy(extracted.policy_number)
     policy_assessment = evaluate_policy(extracted, policy_record=policy_record)
@@ -108,6 +121,7 @@ if st.button("Submit Claim", type="primary"):
     if duplicate_id:
         duplicate_warning = f"Possible duplicate of existing claim {duplicate_id}"
         recommendation, reason = "REQUEST_INFO", duplicate_warning
+        logger.warning("Duplicate claim detected: existing_claim_id=%s", duplicate_id)
 
     assessment = ClaimAssessment(
         claim_id="",  # filled by db
@@ -129,6 +143,7 @@ if st.button("Submit Claim", type="primary"):
     )
 
     claim_id = save_claim(extracted, assessment, bundle)
+    logger.info("Claim submission completed: claim_id=%s, recommendation=%s", claim_id, recommendation)
 
     st.success(f"Claim submitted! Claim ID: **{claim_id}**")
     badge = {"APPROVE": "🟢", "REJECT": "🔴", "REQUEST_INFO": "🟡"}[recommendation]
